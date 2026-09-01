@@ -1,0 +1,32 @@
+[package]
+name = "codex-switcher"
+version = "1.0.0"
+edition = "2024"
+description = "Fast, local account switching for Codex CLI and IDE integrations"
+authors = ["Damian Grubecki"]
+license = "MIT"
+readme = "README.md"
+rust-version = "1.85"
+publish = false
+keywords = ["codex", "chatgpt", "cli", "account", "profile"]
+categories = ["command-line-utilities"]
+include = [
+    "src/**",
+    "tests/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+]
+
+[dependencies]
+chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
+serde_json = "1.0.143"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"

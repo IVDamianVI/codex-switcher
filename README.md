@@ -1,0 +1,181 @@
+# codex-switcher
+
+`codex-switcher` is a small command-line tool for keeping multiple local
+ChatGPT/Codex account profiles and switching between them quickly. It targets
+macOS first and works with Codex CLI and Codex integrations that use the same
+local authentication cache, including JetBrains IDEs such as PhpStorm.
+
+> [!IMPORTANT]
+> This is an independent, unofficial project. It is not affiliated with,
+> endorsed by, or supported by OpenAI. Codex, ChatGPT, and OpenAI are trademarks
+> of their respective owner.
+
+## Features
+
+- Create named profiles such as `personal` and `work`.
+- Switch the active account with one command.
+- Use the same active profile in Codex CLI and supported IDE integrations.
+- Display the ChatGPT plan, five-hour usage, weekly usage, remaining quota, and
+  reset times for every profile.
+- Preserve refreshed OAuth credentials when switching profiles.
+- Replace the active authentication file atomically.
+- Store profile files with restrictive Unix permissions (`0600` for files and
+  `0700` for directories).
+
+## Requirements
+
+- macOS. Other Unix-like systems may work but are not currently a primary
+  support target.
+- [Rust](https://www.rust-lang.org/tools/install) 1.85 or newer.
+- Codex CLI available as the `codex` command.
+- File-based Codex credential storage. `codex-switcher init` configures it.
+
+## Installation
+
+From a local checkout:
+
+```sh
+cargo install --path .
+codex-switcher init
+```
+
+`init` sets `cli_auth_credentials_store = "file"` in
+`~/.codex/config.toml`. If the file already exists, its original contents are
+backed up once to `~/.codex/config.toml.codex-switcher.bak`.
+
+### Updating an existing installation
+
+From the repository directory, rebuild and replace the installed executable:
+
+```sh
+cargo install --path . --force
+codex-switcher --version
+```
+
+The update replaces only the executable. Existing profiles in
+`~/.codex-switcher` and the active Codex authentication file are not removed.
+
+## Quick start
+
+If Codex is currently signed in to your personal account, capture it:
+
+```sh
+codex-switcher add personal
+```
+
+Log in to another account and save it as `work`:
+
+```sh
+codex-switcher login work
+```
+
+Use device-code authentication when a browser callback is unavailable:
+
+```sh
+codex-switcher login work --device-auth
+```
+
+Switch profiles:
+
+```sh
+codex-switcher use personal
+codex-switcher use work
+```
+
+The next Codex CLI process uses the selected profile. If a Codex chat is already
+open in PhpStorm, close and reopen the chat. Some integration versions may
+require restarting the IDE because a running process can retain credentials in
+memory.
+
+## Commands
+
+| Command | Description |
+| --- | --- |
+| `codex-switcher init` | Configure file-based credentials and create the profile directory. |
+| `codex-switcher add <name>` | Save the current Codex login as a profile. |
+| `codex-switcher login <name>` | Run the Codex login flow and save the resulting profile. |
+| `codex-switcher use <name>` | Make a saved profile active. |
+| `codex-switcher list` | List profiles with plan and quota information. |
+| `codex-switcher current` | Print the active managed profile. |
+| `codex-switcher remove <name>` | Remove a saved profile. |
+| `codex-switcher doctor` | Check the local setup. |
+
+Use `--force` with `add`, `login`, or `remove` where supported. Run
+`codex-switcher help` for the current command synopsis.
+
+## Profile usage and limits
+
+`codex-switcher list` queries profiles in parallel through the stable Codex
+app-server account API. It does not change the account active in Codex CLI or
+your IDE.
+
+```text
+PROFILE     PLAN  5H USED  5H LEFT  WEEKLY USED  WEEKLY LEFT  5H RESET          WEEKLY RESET
+* personal  PLUS  25%      75%      40%          60%          2026-09-01 23:15  2026-09-07 10:00
+  work      PRO   10%      90%      15%          85%          2026-09-01 22:40  2026-09-06 08:00
+```
+
+Reset times use the computer's local time zone. A dash (`—`) means the service
+did not return that field, the exact quota window is unavailable, or the
+profile uses API-key billing instead of a ChatGPT subscription quota.
+
+## Storage and security
+
+Codex stores file-based credentials in `~/.codex/auth.json`.
+`codex-switcher` stores one protected copy per profile in
+`~/.codex-switcher/profiles/` and atomically replaces the active cache when
+switching. Before a switch, it saves the current cache back to the active
+profile so refreshed OAuth credentials are retained.
+
+Authentication files contain secrets equivalent to a signed-in session:
+
+- Never commit, share, print, or paste them into an issue.
+- Do not put `~/.codex-switcher` in an untrusted or unencrypted backup.
+- Do not switch accounts while another Codex process is actively refreshing
+  authentication state.
+- Run `codex-switcher doctor` after changing Codex authentication settings.
+
+The program does not print token values. It treats authentication files as
+opaque data and only copies them between protected locations. Temporary
+directories used to query limits are removed after use.
+
+See [SECURITY.md](SECURITY.md) for reporting vulnerabilities.
+
+## Environment variables
+
+- `CODEX_HOME` changes the Codex data directory. The default is `~/.codex`.
+- `CODEX_SWITCHER_HOME` changes the profile directory. The default is
+  `~/.codex-switcher`.
+
+For PhpStorm compatibility, prefer the default `CODEX_HOME`. Applications
+launched from Finder do not necessarily inherit variables configured in a shell.
+
+## Limitations
+
+- The tool switches local Codex authentication, not a browser session on
+  chatgpt.com.
+- macOS Keychain entries are not manipulated. Codex does not expose a public
+  account-profile interface for those entries, so file-based storage is
+  required.
+- Already-running Codex or IDE processes may continue using credentials loaded
+  before the switch.
+- Usage and plan information depends on fields returned by the installed Codex
+  app-server and the authenticated account.
+
+## Development
+
+Keep `Cargo.lock` committed because this repository builds an application.
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+cargo build --release
+```
+
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening
+a pull request.
+
+## License
+
+Licensed under the [MIT License](LICENSE). Copyright © 2026 Damian Grubecki.

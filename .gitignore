@@ -1,0 +1,35 @@
+# Rust build output
+/target/
+
+# IDE and editor state
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+
+# Local environment and logs
+.env
+.env.*
+!.env.example
+*.log
+
+# Credentials and private keys
+**/auth.json
+**/.codex/
+**/.codex-switcher/
+*.pem
+*.key
+*.p12
+*.pfx
+*.token
+
+# Local configuration backups and temporary files
+*.bak
+*.tmp
+*.temp
+
