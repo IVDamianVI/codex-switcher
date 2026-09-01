@@ -32,6 +32,41 @@ local authentication cache, including JetBrains IDEs such as PhpStorm.
 
 ## Installation
 
+### Install from a GitHub Release (Apple Silicon)
+
+Download the `v1.0.0` archive and its checksum from
+[GitHub Releases](https://github.com/IVDamianVI/codex-switcher/releases):
+
+```sh
+curl -fLO https://github.com/IVDamianVI/codex-switcher/releases/download/v1.0.0/codex-switcher-v1.0.0-aarch64-apple-darwin.tar.gz
+curl -fLO https://github.com/IVDamianVI/codex-switcher/releases/download/v1.0.0/codex-switcher-v1.0.0-aarch64-apple-darwin.tar.gz.sha256
+```
+
+Verify the download before extracting it:
+
+```sh
+shasum -a 256 -c codex-switcher-v1.0.0-aarch64-apple-darwin.tar.gz.sha256
+```
+
+Install the executable for the current user:
+
+```sh
+tar -xzf codex-switcher-v1.0.0-aarch64-apple-darwin.tar.gz
+mkdir -p "$HOME/.local/bin"
+install -m 755 codex-switcher "$HOME/.local/bin/codex-switcher"
+codex-switcher --version
+codex-switcher init
+```
+
+The expected version is `codex-switcher 1.0.0`. If `codex-switcher` is not
+found, add `$HOME/.local/bin` to your shell's `PATH` and open a new terminal.
+
+The current prebuilt release targets Apple Silicon Macs. To check your Mac,
+run `uname -m`; `arm64` means Apple Silicon. Intel Mac users can install from
+source until an `x86_64-apple-darwin` release is available.
+
+### Install from source
+
 From a local checkout:
 
 ```sh
@@ -45,7 +80,9 @@ backed up once to `~/.codex/config.toml.codex-switcher.bak`.
 
 ### Updating an existing installation
 
-From the repository directory, rebuild and replace the installed executable:
+To update from a future Release, repeat the Release installation steps with the
+new version number. To update from source, run the following from the repository
+directory:
 
 ```sh
 cargo install --path . --force
