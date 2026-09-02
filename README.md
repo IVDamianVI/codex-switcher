@@ -36,31 +36,31 @@ local authentication cache, including JetBrains IDEs such as PhpStorm.
 
 ### Install from a GitHub Release (Apple Silicon)
 
-Download the `v1.0.0` archive and its checksum from
+Download the `v1.2.0` archive and its checksum from
 [GitHub Releases](https://github.com/IVDamianVI/codex-switcher/releases):
 
 ```sh
-curl -fLO https://github.com/IVDamianVI/codex-switcher/releases/download/v1.0.0/codex-switcher-v1.0.0-aarch64-apple-darwin.tar.gz
-curl -fLO https://github.com/IVDamianVI/codex-switcher/releases/download/v1.0.0/codex-switcher-v1.0.0-aarch64-apple-darwin.tar.gz.sha256
+curl -fLO https://github.com/IVDamianVI/codex-switcher/releases/download/v1.2.0/codex-switcher-v1.2.0-aarch64-apple-darwin.tar.gz
+curl -fLO https://github.com/IVDamianVI/codex-switcher/releases/download/v1.2.0/codex-switcher-v1.2.0-aarch64-apple-darwin.tar.gz.sha256
 ```
 
 Verify the download before extracting it:
 
 ```sh
-shasum -a 256 -c codex-switcher-v1.0.0-aarch64-apple-darwin.tar.gz.sha256
+shasum -a 256 -c codex-switcher-v1.2.0-aarch64-apple-darwin.tar.gz.sha256
 ```
 
 Install the executable for the current user:
 
 ```sh
-tar -xzf codex-switcher-v1.0.0-aarch64-apple-darwin.tar.gz
+tar -xzf codex-switcher-v1.2.0-aarch64-apple-darwin.tar.gz
 mkdir -p "$HOME/.local/bin"
 install -m 755 codex-switcher "$HOME/.local/bin/codex-switcher"
 codex-switcher --version
 codex-switcher init
 ```
 
-The expected version is `codex-switcher 1.0.0`. If `codex-switcher` is not
+The expected version is `codex-switcher 1.2.0`. If `codex-switcher` is not
 found, add `$HOME/.local/bin` to your shell's `PATH` and open a new terminal.
 
 The current prebuilt release targets Apple Silicon Macs. To check your Mac,
