@@ -1,4 +1,4 @@
-use chrono::{Local, TimeZone};
+use chrono::{Duration as ChronoDuration, Local, NaiveDate, TimeZone};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::env;
@@ -21,7 +21,10 @@ const ANSI_GREEN: &str = "\x1b[32m";
 const ANSI_CYAN: &str = "\x1b[36m";
 const ANSI_YELLOW: &str = "\x1b[33m";
 const ANSI_RED: &str = "\x1b[31m";
+const ANSI_PURPLE: &str = "\x1b[35m";
+const ANSI_WHITE: &str = "\x1b[37m";
 const ANSI_GOLD: &str = "\x1b[1;33m";
+const ANSI_HEADING: &str = "\x1b[1;36m";
 const ANSI_HINT: &str = "\x1b[2;37m";
 
 type Result<T> = std::result::Result<T, String>;
@@ -58,6 +61,10 @@ fn run(args: Vec<OsString>) -> Result<()> {
             switch(&paths, &name)
         }
         "list" | "ls" => list(&paths),
+        "stats" => {
+            let (name, period_days) = parse_stats_args(&args[1..])?;
+            stats(&paths, &name, period_days)
+        }
         "current" => current(&paths),
         "remove" | "rm" => {
             let (name, force) = parse_profile_args(&args[1..], true)?;
@@ -343,6 +350,7 @@ fn list(paths: &Paths) -> Result<()> {
 #[derive(Clone, Debug, Default)]
 struct Window {
     used_percent: f64,
+    duration_mins: u64,
     resets_at: Option<i64>,
 }
 
@@ -352,6 +360,19 @@ struct Usage {
     five_hours: Option<Window>,
     weekly: Option<Window>,
     lifetime_tokens: Option<u64>,
+    peak_daily_tokens: Option<u64>,
+    longest_running_turn_sec: Option<u64>,
+    current_streak_days: Option<u64>,
+    longest_streak_days: Option<u64>,
+    daily_usage: Vec<DailyUsage>,
+    daily_usage_available: bool,
+    reset_credits: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct DailyUsage {
+    date: NaiveDate,
+    tokens: u64,
 }
 
 impl Usage {
@@ -370,9 +391,312 @@ impl Usage {
             format_reset(self.five_hours.as_ref()),
             format_left(self.weekly.as_ref()),
             format_reset(self.weekly.as_ref()),
-            format_tokens(self.lifetime_tokens),
         ]
     }
+}
+
+fn stats(paths: &Paths, name: &str, period_days: u64) -> Result<()> {
+    validate_name(name)?;
+    let _lock = Lock::acquire(paths)?;
+    ensure_initialized(paths)?;
+    save_active(paths)?;
+    validate_auth_file(&paths.profile(name))
+        .map_err(|_| format!("profile '{name}' does not exist or is invalid"))?;
+
+    let mut spinner = Spinner::start("Loading account statistics...");
+    let usage = query_profile(paths, name);
+    spinner.stop();
+    print_stats(name, &usage?, period_days);
+    Ok(())
+}
+
+fn print_stats(name: &str, usage: &Usage, period_days: u64) {
+    let colors = colors_enabled();
+    let today = Local::now().date_naive();
+    let selected = usage_for_period(&usage.daily_usage, today, period_days);
+    let today_tokens = daily_tokens_for_date(&usage.daily_usage, today);
+
+    println!();
+    println!(
+        "{}",
+        styled_message("ACCOUNT STATISTICS", ANSI_HEADING, colors)
+    );
+    println!("{}", format_stat_row("Profile", name, ANSI_GOLD, colors));
+    println!(
+        "{}",
+        format_stat_row("Plan", &value_or_dash(&usage.plan), ANSI_PURPLE, colors)
+    );
+    println!(
+        "{}",
+        format_stat_row(
+            "Lifetime tokens",
+            &format_tokens(usage.lifetime_tokens),
+            ANSI_WHITE,
+            colors
+        )
+    );
+    println!(
+        "{}",
+        format_stat_row(
+            &format!("Today ({today})"),
+            &format_tokens(today_tokens),
+            ANSI_CYAN,
+            colors
+        )
+    );
+    println!(
+        "{}",
+        format_stat_row(
+            "Daily record",
+            &format_tokens(usage.peak_daily_tokens),
+            ANSI_CYAN,
+            colors
+        )
+    );
+    println!(
+        "{}",
+        format_stat_row(
+            "Longest turn",
+            &format_duration(usage.longest_running_turn_sec),
+            ANSI_WHITE,
+            colors
+        )
+    );
+    println!(
+        "{}",
+        format_stat_row(
+            "Current streak",
+            &format_days(usage.current_streak_days),
+            ANSI_GREEN,
+            colors
+        )
+    );
+    println!(
+        "{}",
+        format_stat_row(
+            "Longest streak",
+            &format_days(usage.longest_streak_days),
+            ANSI_WHITE,
+            colors
+        )
+    );
+    let resets = usage
+        .reset_credits
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "—".to_owned());
+    let reset_color = if 0 == usage.reset_credits.unwrap_or(0) {
+        ANSI_HINT
+    } else {
+        ANSI_GREEN
+    };
+    println!(
+        "{}",
+        format_stat_row("Available resets", &resets, reset_color, colors)
+    );
+
+    println!();
+    println!("{}", styled_message("LIMITS", ANSI_HEADING, colors));
+    println!(
+        "{}",
+        styled_message(
+            "WINDOW    LEFT  RESET             PACE       FORECAST",
+            ANSI_HINT,
+            colors
+        )
+    );
+    print_limit_stats("5 hours", usage.five_hours.as_ref(), colors);
+    print_limit_stats("Weekly", usage.weekly.as_ref(), colors);
+
+    println!();
+    let trend = if usage.daily_usage_available {
+        format_activity_trend(&usage.daily_usage, today, period_days)
+    } else {
+        "trend unavailable".to_owned()
+    };
+    let activity_title = format!(
+        "ACTIVITY · LAST {period_days} {}",
+        if 1 == period_days { "DAY" } else { "DAYS" }
+    );
+    println!(
+        "{} · {}",
+        styled_message(&activity_title, ANSI_HEADING, colors),
+        styled_message(&trend, trend_color(&trend), colors)
+    );
+    if selected.is_empty() {
+        if usage.daily_usage_available {
+            println!("No activity in this period.");
+        } else {
+            println!("No daily activity returned for this period.");
+        }
+    } else {
+        let peak = selected
+            .iter()
+            .map(|bucket| bucket.tokens)
+            .max()
+            .unwrap_or(0);
+        for bucket in selected {
+            println!(
+                "{}  {}  {}",
+                styled_message(&bucket.date.to_string(), ANSI_HINT, colors),
+                styled_message(
+                    &format!("{:>8}", format_token_count(bucket.tokens)),
+                    ANSI_WHITE,
+                    colors
+                ),
+                styled_message(&activity_bar(bucket.tokens, peak), ANSI_CYAN, colors)
+            );
+        }
+    }
+    println!();
+}
+
+fn format_stat_row(label: &str, value: &str, value_color: &str, colors: bool) -> String {
+    format!(
+        "{}{}",
+        styled_message(&format!("{label:<20}"), ANSI_HINT, colors),
+        styled_message(value, value_color, colors)
+    )
+}
+
+fn print_limit_stats(label: &str, window: Option<&Window>, colors: bool) {
+    let left = format_left(window);
+    let reset = format_reset(window);
+    let (pace, forecast) = window
+        .map(limit_forecast)
+        .unwrap_or_else(|| ("—".to_owned(), "—".to_owned()));
+    let forecast_color = if forecast.starts_with("empty") {
+        ANSI_RED
+    } else if "lasts until reset" == forecast {
+        ANSI_GREEN
+    } else {
+        ANSI_HINT
+    };
+    println!(
+        "{} {}  {}  {}  {}",
+        styled_message(&format!("{label:<9}"), ANSI_WHITE, colors),
+        styled_message(&format!("{left:>4}"), remaining_color(&left), colors),
+        styled_message(&format!("{reset:<16}"), ANSI_WHITE, colors),
+        styled_message(&format!("{pace:<9}"), ANSI_YELLOW, colors),
+        styled_message(&forecast, forecast_color, colors)
+    );
+}
+
+fn trend_color(trend: &str) -> &'static str {
+    if trend.starts_with("trend +") || "trend new activity" == trend {
+        ANSI_GREEN
+    } else if trend.starts_with("trend -") {
+        ANSI_RED
+    } else {
+        ANSI_HINT
+    }
+}
+
+fn limit_forecast(window: &Window) -> (String, String) {
+    let Some(resets_at) = window.resets_at else {
+        return ("—".to_owned(), "—".to_owned());
+    };
+    if !window.used_percent.is_finite() || window.used_percent <= 0.0 {
+        return ("0%/h".to_owned(), "not at current pace".to_owned());
+    }
+
+    let now = Local::now().timestamp();
+    let window_seconds = match i64::try_from(window.duration_mins.saturating_mul(60)) {
+        Ok(seconds) => seconds,
+        Err(_) => return ("—".to_owned(), "—".to_owned()),
+    };
+    let started_at = resets_at.saturating_sub(window_seconds);
+    let elapsed = now.saturating_sub(started_at);
+    if 0 >= elapsed || resets_at <= now {
+        return ("—".to_owned(), "—".to_owned());
+    }
+
+    let used_per_second = window.used_percent / elapsed as f64;
+    let pace_per_hour = used_per_second * 3_600.0;
+    let seconds_left = (100.0 - window.used_percent).max(0.0) / used_per_second;
+    let exhaustion = now.saturating_add(seconds_left.round() as i64);
+    let forecast = if exhaustion < resets_at {
+        Local
+            .timestamp_opt(exhaustion, 0)
+            .single()
+            .map(|time| format!("empty ~{}", time.format("%Y-%m-%d %H:%M")))
+            .unwrap_or_else(|| "—".to_owned())
+    } else {
+        "lasts until reset".to_owned()
+    };
+    (format!("{pace_per_hour:.1}%/h"), forecast)
+}
+
+fn usage_for_period(usage: &[DailyUsage], today: NaiveDate, period_days: u64) -> Vec<&DailyUsage> {
+    let days = i64::try_from(period_days).unwrap_or(i64::MAX);
+    let start = today - ChronoDuration::days(days.saturating_sub(1));
+    let mut selected: Vec<&DailyUsage> = usage
+        .iter()
+        .filter(|bucket| start <= bucket.date && bucket.date <= today)
+        .collect();
+    selected.sort_unstable_by_key(|bucket| bucket.date);
+    selected
+}
+
+fn daily_tokens_for_date(usage: &[DailyUsage], date: NaiveDate) -> Option<u64> {
+    usage
+        .iter()
+        .find(|bucket| date == bucket.date)
+        .map(|bucket| bucket.tokens)
+}
+
+fn format_activity_trend(usage: &[DailyUsage], today: NaiveDate, period_days: u64) -> String {
+    let days = i64::try_from(period_days).unwrap_or(i64::MAX);
+    let current_start = today - ChronoDuration::days(days.saturating_sub(1));
+    let previous_end = current_start - ChronoDuration::days(1);
+    let previous_start = previous_end - ChronoDuration::days(days.saturating_sub(1));
+    let current: u64 = usage
+        .iter()
+        .filter(|bucket| current_start <= bucket.date && bucket.date <= today)
+        .map(|bucket| bucket.tokens)
+        .sum();
+    let previous: u64 = usage
+        .iter()
+        .filter(|bucket| previous_start <= bucket.date && bucket.date <= previous_end)
+        .map(|bucket| bucket.tokens)
+        .sum();
+
+    match (current, previous) {
+        (0, 0) => "trend flat".to_owned(),
+        (_, 0) => "trend new activity".to_owned(),
+        _ => {
+            let change = (current as f64 - previous as f64) / previous as f64 * 100.0;
+            format!("trend {change:+.0}% vs previous period")
+        }
+    }
+}
+
+fn activity_bar(tokens: u64, peak: u64) -> String {
+    if 0 == tokens || 0 == peak {
+        return String::new();
+    }
+    let width = ((tokens as f64 / peak as f64) * 20.0).ceil() as usize;
+    "█".repeat(width.max(1))
+}
+
+fn format_duration(seconds: Option<u64>) -> String {
+    let Some(seconds) = seconds else {
+        return "—".to_owned();
+    };
+    let hours = seconds / 3_600;
+    let minutes = seconds % 3_600 / 60;
+    let seconds = seconds % 60;
+    if 0 < hours {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if 0 < minutes {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn format_days(days: Option<u64>) -> String {
+    days.map(|days| format!("{days} days"))
+        .unwrap_or_else(|| "—".to_owned())
 }
 
 struct Spinner {
@@ -574,7 +898,9 @@ fn query_profile(paths: &Paths, name: &str) -> Result<Usage> {
     let account = account.ok_or_else(|| "account query timed out".to_owned())?;
     let rate_limits = rate_limits.ok_or_else(|| "rate-limit query timed out".to_owned())?;
     let mut usage = parse_usage(&account, &rate_limits);
-    usage.lifetime_tokens = token_usage.as_ref().and_then(parse_lifetime_tokens);
+    if let Some(token_usage) = token_usage.as_ref() {
+        apply_token_usage(&mut usage, token_usage);
+    }
 
     let refreshed_auth = query_dir.path.join("auth.json");
     if validate_auth_file(&refreshed_auth).is_ok() {
@@ -630,12 +956,46 @@ fn parse_usage(account: &Value, rate_limits: &Value) -> Usage {
         five_hours: find_window(&windows, FIVE_HOURS_MINS),
         weekly: find_window(&windows, WEEK_MINS),
         lifetime_tokens: None,
+        peak_daily_tokens: None,
+        longest_running_turn_sec: None,
+        current_streak_days: None,
+        longest_streak_days: None,
+        daily_usage: Vec::new(),
+        daily_usage_available: false,
+        reset_credits: rate_limits
+            .pointer("/rateLimitResetCredits/availableCount")
+            .and_then(Value::as_u64),
     }
 }
 
-fn parse_lifetime_tokens(token_usage: &Value) -> Option<u64> {
+fn apply_token_usage(usage: &mut Usage, token_usage: &Value) {
+    usage.lifetime_tokens = summary_u64(token_usage, "lifetimeTokens");
+    usage.peak_daily_tokens = summary_u64(token_usage, "peakDailyTokens");
+    usage.longest_running_turn_sec = summary_u64(token_usage, "longestRunningTurnSec");
+    usage.current_streak_days = summary_u64(token_usage, "currentStreakDays");
+    usage.longest_streak_days = summary_u64(token_usage, "longestStreakDays");
+    let daily_usage = token_usage
+        .get("dailyUsageBuckets")
+        .and_then(Value::as_array);
+    usage.daily_usage_available = daily_usage.is_some();
+    usage.daily_usage = daily_usage
+        .into_iter()
+        .flatten()
+        .filter_map(|bucket| {
+            let date = bucket
+                .get("startDate")
+                .and_then(Value::as_str)
+                .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())?;
+            let tokens = bucket.get("tokens").and_then(Value::as_u64)?;
+            Some(DailyUsage { date, tokens })
+        })
+        .collect();
+}
+
+fn summary_u64(token_usage: &Value, field: &str) -> Option<u64> {
     token_usage
-        .pointer("/summary/lifetimeTokens")
+        .get("summary")
+        .and_then(|summary| summary.get(field))
         .and_then(Value::as_u64)
 }
 
@@ -654,6 +1014,7 @@ fn collect_windows(bucket: &Value, windows: &mut Vec<(u64, Window)>) {
             duration,
             Window {
                 used_percent,
+                duration_mins: duration,
                 resets_at: value.get("resetsAt").and_then(Value::as_i64),
             },
         ));
@@ -746,14 +1107,13 @@ fn value_or_dash(value: &str) -> String {
 }
 
 fn print_table(rows: &[Vec<String>]) {
-    const HEADERS: [&str; 7] = [
+    const HEADERS: [&str; 6] = [
         "PROFILE",
         "PLAN",
         "5H LEFT",
         "5H RESET",
         "WEEKLY LEFT",
         "WEEKLY RESET",
-        "TOKENS USED",
     ];
     let mut widths: Vec<usize> = HEADERS.iter().map(|header| header.len()).collect();
     for row in rows {
@@ -883,7 +1243,7 @@ fn colorize_cell(cell: &str, value: &str, index: usize, header: bool, colors: bo
             0 if value.starts_with("* ") => "\x1b[1;33m",
             1 => "\x1b[35m",
             2 | 4 => remaining_color(value),
-            3 | 5 | 6 => "\x1b[37m",
+            3 | 5 => "\x1b[37m",
             _ => "",
         }
     };
@@ -1236,6 +1596,49 @@ fn parse_login_args(args: &[OsString]) -> Result<(String, bool, bool)> {
         .ok_or_else(|| "missing profile name".to_owned())
 }
 
+fn parse_stats_args(args: &[OsString]) -> Result<(String, u64)> {
+    const DEFAULT_PERIOD_DAYS: u64 = 7;
+    const MAX_PERIOD_DAYS: u64 = 365;
+
+    let mut name = None;
+    let mut period_days = DEFAULT_PERIOD_DAYS;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].to_str() {
+            Some("--period") => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .and_then(|value| value.to_str())
+                    .ok_or_else(|| "missing value for --period".to_owned())?;
+                period_days = parse_period(value, MAX_PERIOD_DAYS)?;
+            }
+            Some(value) if !value.starts_with('-') && name.is_none() => {
+                name = Some(value.to_owned());
+            }
+            Some(value) => return Err(format!("unexpected argument '{value}'")),
+            None => return Err("arguments must be valid UTF-8".to_owned()),
+        }
+        index += 1;
+    }
+
+    name.map(|name| (name, period_days))
+        .ok_or_else(|| "missing profile name".to_owned())
+}
+
+fn parse_period(value: &str, maximum_days: u64) -> Result<u64> {
+    let number = value
+        .strip_suffix('d')
+        .ok_or_else(|| "period must use the form Nd, for example 30d".to_owned())?;
+    let days = number
+        .parse::<u64>()
+        .map_err(|_| "period must use the form Nd, for example 30d".to_owned())?;
+    if 0 == days || maximum_days < days {
+        return Err(format!("period must be between 1d and {maximum_days}d"));
+    }
+    Ok(days)
+}
+
 fn print_help() {
     println!(
         "codex-switcher {VERSION}\n\
@@ -1246,6 +1649,7 @@ fn print_help() {
            codex-switcher login <name> [--device-auth] [--force]\n\
            codex-switcher use <name>\n\
            codex-switcher list\n\
+           codex-switcher stats <name> [--period <Nd>]\n\
            codex-switcher current\n\
            codex-switcher remove <name> [--force]\n\
            codex-switcher doctor\n\n\
@@ -1334,8 +1738,28 @@ mod tests {
 
     #[test]
     fn parses_and_formats_lifetime_token_usage() {
-        let usage = json!({ "summary": { "lifetimeTokens": 1_500_000 } });
-        assert_eq!(parse_lifetime_tokens(&usage), Some(1_500_000));
+        let token_usage = json!({
+            "summary": {
+                "lifetimeTokens": 1_500_000,
+                "peakDailyTokens": 45_678,
+                "longestRunningTurnSec": 540,
+                "currentStreakDays": 8,
+                "longestStreakDays": 14
+            },
+            "dailyUsageBuckets": [
+                { "startDate": "2026-09-01", "tokens": 12_345 },
+                { "startDate": "invalid", "tokens": 99 }
+            ]
+        });
+        let mut usage = Usage::default();
+        apply_token_usage(&mut usage, &token_usage);
+        assert_eq!(usage.lifetime_tokens, Some(1_500_000));
+        assert_eq!(usage.peak_daily_tokens, Some(45_678));
+        assert_eq!(usage.longest_running_turn_sec, Some(540));
+        assert_eq!(usage.current_streak_days, Some(8));
+        assert_eq!(usage.longest_streak_days, Some(14));
+        assert_eq!(usage.daily_usage.len(), 1);
+        assert_eq!(usage.daily_usage[0].tokens, 12_345);
         assert_eq!(format_token_count(100), "100");
         assert_eq!(format_token_count(900), "900");
         assert_eq!(format_token_count(1_000), "1K");
@@ -1344,6 +1768,65 @@ mod tests {
         assert_eq!(format_token_count(4_200_000), "4,2M");
         assert_eq!(format_token_count(999_999), "1M");
         assert_eq!(format_tokens(None), "—");
+    }
+
+    #[test]
+    fn parses_stats_period() {
+        assert_eq!(parse_period("30d", 365), Ok(30));
+        assert!(parse_period("0d", 365).is_err());
+        assert!(parse_period("366d", 365).is_err());
+        assert!(parse_period("30", 365).is_err());
+    }
+
+    #[test]
+    fn calculates_activity_trend_and_bar() {
+        let today = NaiveDate::from_ymd_opt(2026, 9, 2).expect("valid date");
+        let usage = vec![
+            DailyUsage {
+                date: today - ChronoDuration::days(8),
+                tokens: 100,
+            },
+            DailyUsage {
+                date: today,
+                tokens: 150,
+            },
+        ];
+        assert_eq!(
+            format_activity_trend(&usage, today, 7),
+            "trend +50% vs previous period"
+        );
+        assert_eq!(activity_bar(50, 100), "██████████");
+        assert_eq!(format_duration(Some(3_661)), "1h 1m 1s");
+    }
+
+    #[test]
+    fn does_not_treat_a_missing_daily_bucket_as_zero_usage() {
+        let today = NaiveDate::from_ymd_opt(2026, 9, 2).expect("valid date");
+        let yesterday = DailyUsage {
+            date: today - ChronoDuration::days(1),
+            tokens: 12_345,
+        };
+        let zero_today = DailyUsage {
+            date: today,
+            tokens: 0,
+        };
+
+        assert_eq!(daily_tokens_for_date(&[yesterday], today), None);
+        assert_eq!(daily_tokens_for_date(&[zero_today], today), Some(0));
+    }
+
+    #[test]
+    fn styles_statistics_without_changing_plain_layout() {
+        assert_eq!(
+            format_stat_row("Profile", "work", ANSI_GOLD, false),
+            "Profile             work"
+        );
+        let colored = format_stat_row("Profile", "work", ANSI_GOLD, true);
+        assert!(colored.starts_with("\x1b[2;37mProfile             \x1b[0m"));
+        assert!(colored.ends_with("\x1b[1;33mwork\x1b[0m"));
+        assert_eq!(trend_color("trend +20% vs previous period"), ANSI_GREEN);
+        assert_eq!(trend_color("trend -20% vs previous period"), ANSI_RED);
+        assert_eq!(trend_color("trend flat"), ANSI_HINT);
     }
 
     #[test]

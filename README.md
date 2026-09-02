@@ -15,8 +15,10 @@ local authentication cache, including JetBrains IDEs such as PhpStorm.
 - Create named profiles such as `personal` and `work`.
 - Switch the active account with one command.
 - Use the same active profile in Codex CLI and supported IDE integrations.
-- Display the ChatGPT plan, remaining five-hour and weekly quota, reset times,
-  and lifetime token usage for every profile.
+- Display the ChatGPT plan, remaining five-hour and weekly quota, and reset
+  times for every profile.
+- Inspect detailed account activity, streaks, earned resets, usage trends, and
+  estimated limit exhaustion for a selected profile.
 - Preserve refreshed OAuth credentials when switching profiles.
 - Replace the active authentication file atomically.
 - Store profile files with restrictive Unix permissions (`0600` for files and
@@ -133,6 +135,7 @@ memory.
 | `codex-switcher login <name>` | Run the Codex login flow and save the resulting profile. |
 | `codex-switcher use <name>` | Make a saved profile active. |
 | `codex-switcher list` | List profiles with plan and quota information. |
+| `codex-switcher stats <name>` | Show detailed usage statistics for a profile. |
 | `codex-switcher current` | Print the active managed profile. |
 | `codex-switcher remove <name>` | Remove a saved profile. |
 | `codex-switcher doctor` | Check the local setup. |
@@ -147,9 +150,9 @@ app-server account API. It does not change the account active in Codex CLI or
 your IDE.
 
 ```text
-PROFILE     PLAN  5H LEFT  5H RESET          WEEKLY LEFT  WEEKLY RESET      TOKENS USED
-* personal  PLUS  75%      2026-09-01 23:15  60%          2026-09-07 10:00  1,5M
-  work      PRO   90%      2026-09-01 22:40  85%          2026-09-06 08:00  654,4K
+PROFILE     PLAN  5H LEFT  5H RESET          WEEKLY LEFT  WEEKLY RESET
+* personal  PLUS  75%      2026-09-01 23:15  60%          2026-09-07 10:00
+  work      PRO   90%      2026-09-01 22:40  85%          2026-09-06 08:00
 ```
 
 Reset times use the computer's local time zone. A dash (`—`) means the service
@@ -158,8 +161,28 @@ profile uses API-key billing instead of a ChatGPT subscription quota. In an
 interactive terminal, remaining quota is colored green, yellow, or red and a
 spinner is shown while profile information is loading. The active profile is
 gold, the plan is purple, and reset times use plain white for contrast. Set
-`NO_COLOR` to disable colors. `TOKENS USED` is the lifetime total reported by
-Codex and is abbreviated to the largest practical unit with one decimal place.
+`NO_COLOR` to disable colors.
+
+## Detailed account statistics
+
+Use `stats` to inspect one profile without switching to it:
+
+```sh
+codex-switcher stats work
+codex-switcher stats work --period 30d
+```
+
+The default activity period is 7 days. `--period` accepts values from `1d` to
+`365d`. The report includes lifetime and today's tokens, the daily record, the
+longest turn, current and longest activity streaks, available earned resets,
+daily activity bars, and a comparison with the preceding period.
+
+The limit forecast extrapolates the current window's average consumption rate.
+It is an estimate, not a value returned by the service, and can change sharply
+as usage changes. A dash (`—`) means the App Server did not provide enough data
+to calculate or display a metric. In particular, today's token count is shown
+only when the service returns a bucket matching the displayed local date; a
+missing bucket is not interpreted as zero usage.
 
 ## Storage and security
 
