@@ -139,9 +139,64 @@ memory.
 | `codex-switcher current` | Print the active managed profile. |
 | `codex-switcher remove <name>` | Remove a saved profile. |
 | `codex-switcher doctor` | Check the local setup. |
+| `codex-switcher completion <zsh\|bash\|fish>` | Generate shell completion with current profile names. |
+| `codex-switcher shell-function <zsh\|bash\|fish>` | Generate the optional `cs` convenience function. |
 
 Use `--force` with `add`, `login`, or `remove` where supported. Run
 `codex-switcher help` for the current command synopsis.
+
+Aliases remain available: `capture` for `add`, `switch` for `use`, `ls` for
+`list`, and `rm` for `remove`.
+
+## Scripting interface
+
+Text output remains the default. Use `--json` with `list`, `stats`, `current`,
+or `doctor` for a versioned machine-readable response. Every response contains
+`schema_version`; missing service data is represented by `null`, quantities are
+JSON numbers, and timestamps use ISO 8601. JSON mode never emits terminal
+colors or a spinner.
+
+For a latency-sensitive prompt, use:
+
+```sh
+codex-switcher current --format prompt
+```
+
+It prints only the active profile name and a newline, or no output when no
+managed profile is active. This path only reads local state and does not start
+the Codex App Server.
+
+Public exit codes are stable:
+
+| Code | Meaning |
+| ---: | --- |
+| `0` | Success |
+| `1` | Other runtime or I/O error |
+| `2` | Invalid command-line arguments |
+| `3` | Missing or invalid initialization/setup |
+| `4` | Missing, invalid, or conflicting profile state |
+| `5` | Authentication or Codex App Server error |
+| `6` | Codex App Server query timeout |
+| `7` | Another operation holds the switcher lock |
+
+Generate completion for the current set of profiles and source or install the
+result according to your shell's conventions:
+
+```sh
+codex-switcher completion zsh
+codex-switcher completion bash
+codex-switcher completion fish
+```
+
+The optional `cs` function is printed, never installed automatically. Review
+and source the output in your shell configuration if wanted:
+
+```sh
+codex-switcher shell-function zsh
+```
+
+After loading it, `cs work` runs `codex-switcher use work`; calling `cs`
+without arguments shows the current profile.
 
 ## Profile usage and limits
 

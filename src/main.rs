@@ -1,8 +1,11 @@
-use chrono::{Duration as ChronoDuration, Local, NaiveDate, TimeZone};
+use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, TimeZone, Utc};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{Shell, generate};
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::env;
-use std::ffi::OsString;
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -27,61 +30,287 @@ const ANSI_GOLD: &str = "\x1b[1;33m";
 const ANSI_HEADING: &str = "\x1b[1;36m";
 const ANSI_HINT: &str = "\x1b[2;37m";
 
-type Result<T> = std::result::Result<T, String>;
+const SCHEMA_VERSION: u64 = 1;
 
-fn main() -> ExitCode {
-    match run(env::args_os().skip(1).collect()) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(message) => {
-            print_error(&message);
-            ExitCode::FAILURE
+type Result<T> = std::result::Result<T, AppError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorKind {
+    Runtime,
+    Arguments,
+    Initialization,
+    Profile,
+    Authentication,
+    Timeout,
+    Locked,
+}
+
+impl ErrorKind {
+    const fn exit_code(self) -> u8 {
+        match self {
+            Self::Runtime => 1,
+            Self::Arguments => 2,
+            Self::Initialization => 3,
+            Self::Profile => 4,
+            Self::Authentication => 5,
+            Self::Timeout => 6,
+            Self::Locked => 7,
         }
     }
 }
 
-fn run(args: Vec<OsString>) -> Result<()> {
-    let command = args
-        .first()
-        .and_then(|value| value.to_str())
-        .unwrap_or("help");
+#[derive(Debug, PartialEq, Eq)]
+struct AppError {
+    kind: ErrorKind,
+    message: String,
+}
+
+impl AppError {
+    fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    fn runtime(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Runtime, message)
+    }
+
+    fn initialization(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Initialization, message)
+    }
+
+    fn profile(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Profile, message)
+    }
+
+    fn authentication(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Authentication, message)
+    }
+
+    fn timeout(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Timeout, message)
+    }
+}
+
+impl fmt::Display for AppError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AppError {}
+
+impl From<String> for AppError {
+    fn from(message: String) -> Self {
+        Self::runtime(message)
+    }
+}
+
+trait ResultContext<T> {
+    fn runtime(self, context: impl FnOnce() -> String) -> Result<T>;
+}
+
+impl<T, E: fmt::Display> ResultContext<T> for std::result::Result<T, E> {
+    fn runtime(self, context: impl FnOnce() -> String) -> Result<T> {
+        self.map_err(|error| AppError::runtime(format!("{}: {error}", context())))
+    }
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "codex-switcher",
+    version,
+    about = "Fast account switching for Codex CLI and IDE integrations"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+impl Cli {
+    fn requests_json(&self) -> bool {
+        matches!(
+            &self.command,
+            Some(
+                Commands::List { json: true }
+                    | Commands::Stats { json: true, .. }
+                    | Commands::Current { json: true, .. }
+                    | Commands::Doctor { json: true }
+            )
+        )
+    }
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Print the installed codex-switcher version.
+    Version,
+    /// Configure file-based Codex credentials and initialize profile storage.
+    Init,
+    /// Save the current Codex authentication as a named profile.
+    #[command(alias = "capture")]
+    Add {
+        /// Profile name.
+        name: String,
+        /// Replace an existing profile with the same name.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Run Codex login and save the authenticated account as a named profile.
+    Login {
+        /// Profile name.
+        name: String,
+        /// Replace an existing profile with the same name.
+        #[arg(long)]
+        force: bool,
+        /// Use Codex device-code authentication.
+        #[arg(long)]
+        device_auth: bool,
+    },
+    /// Switch the active Codex authentication to a saved profile.
+    #[command(alias = "switch")]
+    Use {
+        /// Profile name.
+        name: String,
+    },
+    /// List saved profiles with their plans, limits, and reset times.
+    #[command(alias = "ls")]
+    List {
+        /// Print versioned machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show detailed usage statistics for a saved profile.
+    Stats {
+        /// Profile name.
+        name: String,
+        /// Activity period from 1d to 365d.
+        #[arg(long, default_value = "7d", value_parser = parse_period_value)]
+        period: u64,
+        /// Print versioned machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the currently active managed profile.
+    Current {
+        /// Print versioned machine-readable JSON.
+        #[arg(long, conflicts_with = "format")]
+        json: bool,
+        /// Select regular text or minimal prompt output.
+        #[arg(long, value_enum, default_value_t = CurrentFormat::Text, conflicts_with = "json")]
+        format: CurrentFormat,
+    },
+    /// Delete a saved profile without logging out the active Codex account.
+    #[command(alias = "rm")]
+    Remove {
+        /// Profile name.
+        name: String,
+        /// Allow removal when this profile is currently active.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Diagnose credentials, active profile state, and Codex availability.
+    Doctor {
+        /// Print versioned machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Generate shell completion for commands, flags, and saved profiles.
+    Completion {
+        /// Target shell.
+        shell: SupportedShell,
+    },
+    /// Generate the optional `cs` convenience function for a shell.
+    #[command(name = "shell-function")]
+    ShellFunction {
+        /// Target shell.
+        shell: SupportedShell,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum CurrentFormat {
+    #[default]
+    Text,
+    Prompt,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum SupportedShell {
+    Zsh,
+    Bash,
+    Fish,
+}
+
+impl From<SupportedShell> for Shell {
+    fn from(shell: SupportedShell) -> Self {
+        match shell {
+            SupportedShell::Zsh => Self::Zsh,
+            SupportedShell::Bash => Self::Bash,
+            SupportedShell::Fish => Self::Fish,
+        }
+    }
+}
+
+fn main() -> ExitCode {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let code = if error.use_stderr() {
+                ErrorKind::Arguments.exit_code()
+            } else {
+                0
+            };
+            let _ = error.print();
+            return ExitCode::from(code);
+        }
+    };
+    let json_output = cli.requests_json();
+    match run(cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            print_error(&error.to_string(), !json_output);
+            ExitCode::from(error.kind.exit_code())
+        }
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
+    let command = match cli.command {
+        Some(Commands::Version) => {
+            println!("codex-switcher {VERSION}");
+            return Ok(());
+        }
+        Some(Commands::ShellFunction { shell }) => return shell_function(shell),
+        command => command,
+    };
     let paths = Paths::discover()?;
 
     match command {
-        "init" => initialize(&paths),
-        "add" | "capture" => {
-            let (name, force) = parse_profile_args(&args[1..], true)?;
-            capture(&paths, &name, force)
-        }
-        "login" => {
-            let (name, force, device_auth) = parse_login_args(&args[1..])?;
-            login(&paths, &name, force, device_auth)
-        }
-        "use" | "switch" => {
-            let (name, _) = parse_profile_args(&args[1..], false)?;
-            switch(&paths, &name)
-        }
-        "list" | "ls" => list(&paths),
-        "stats" => {
-            let (name, period_days) = parse_stats_args(&args[1..])?;
-            stats(&paths, &name, period_days)
-        }
-        "current" => current(&paths),
-        "remove" | "rm" => {
-            let (name, force) = parse_profile_args(&args[1..], true)?;
-            remove(&paths, &name, force)
-        }
-        "doctor" => doctor(&paths),
-        "help" | "--help" | "-h" => {
-            print_help();
+        Some(Commands::Init) => initialize(&paths),
+        Some(Commands::Add { name, force }) => capture(&paths, &name, force),
+        Some(Commands::Login {
+            name,
+            force,
+            device_auth,
+        }) => login(&paths, &name, force, device_auth),
+        Some(Commands::Use { name }) => switch(&paths, &name),
+        Some(Commands::List { json }) => list(&paths, json),
+        Some(Commands::Stats { name, period, json }) => stats(&paths, &name, period, json),
+        Some(Commands::Current { json, format }) => current(&paths, json, format),
+        Some(Commands::Remove { name, force }) => remove(&paths, &name, force),
+        Some(Commands::Doctor { json }) => doctor(&paths, json),
+        Some(Commands::Completion { shell }) => completion(&paths, shell),
+        Some(Commands::Version | Commands::ShellFunction { .. }) => unreachable!(),
+        None => {
+            Cli::command()
+                .print_help()
+                .runtime(|| "cannot print help".to_owned())?;
+            println!();
             Ok(())
         }
-        "version" | "--version" | "-V" => {
-            println!("codex-switcher {VERSION}");
-            Ok(())
-        }
-        unknown => Err(format!(
-            "unknown command '{unknown}'. Run 'codex-switcher help'."
-        )),
     }
 }
 
@@ -95,7 +324,7 @@ impl Paths {
     fn discover() -> Result<Self> {
         let home = env::var_os("HOME")
             .map(PathBuf::from)
-            .ok_or_else(|| "HOME is not set".to_owned())?;
+            .ok_or_else(|| AppError::initialization("HOME is not set"))?;
         let codex_home = env::var_os("CODEX_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".codex"));
@@ -154,10 +383,18 @@ impl Lock {
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                     thread::sleep(Duration::from_millis(100));
                 }
-                Err(error) => return Err(format!("cannot create operation lock: {error}")),
+                Err(error) => {
+                    return Err(AppError::new(
+                        ErrorKind::Locked,
+                        format!("cannot create operation lock: {error}"),
+                    ));
+                }
             }
         }
-        Err("another codex-switcher operation is running (remove ~/.codex-switcher/lock if it is stale)".to_owned())
+        Err(AppError::new(
+            ErrorKind::Locked,
+            "another codex-switcher operation is running (remove ~/.codex-switcher/lock if it is stale)",
+        ))
     }
 }
 
@@ -176,7 +413,12 @@ fn initialize(paths: &Paths) -> Result<()> {
     let original = match fs::read_to_string(&config_path) {
         Ok(content) => content,
         Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(format!("cannot read {}: {error}", config_path.display())),
+        Err(error) => {
+            return Err(AppError::initialization(format!(
+                "cannot read {}: {error}",
+                config_path.display()
+            )));
+        }
     };
     let updated = configure_file_credentials(&original);
 
@@ -208,9 +450,9 @@ fn capture(paths: &Paths, name: &str, force: bool) -> Result<()> {
     validate_auth_file(&auth)?;
     let destination = paths.profile(name);
     if destination.exists() && !force {
-        return Err(format!(
+        return Err(AppError::profile(format!(
             "profile '{name}' already exists; pass --force to replace it"
-        ));
+        )));
     }
 
     save_active(paths)?;
@@ -229,9 +471,9 @@ fn login(paths: &Paths, name: &str, force: bool, device_auth: bool) -> Result<()
     validate_name(name)?;
     let profile = paths.profile(name);
     if profile.exists() && !force {
-        return Err(format!(
+        return Err(AppError::profile(format!(
             "profile '{name}' already exists; pass --force to replace it"
-        ));
+        )));
     }
 
     let _lock = Lock::acquire(paths)?;
@@ -253,18 +495,18 @@ fn login(paths: &Paths, name: &str, force: bool, device_auth: bool) -> Result<()
         Err(error) => {
             restore_auth(paths, previous_auth.as_deref())?;
             write_active(paths, previous_active.as_deref())?;
-            return Err(format!(
+            return Err(AppError::authentication(format!(
                 "cannot start 'codex login': {error}; restored the previous active profile"
-            ));
+            )));
         }
     };
 
     if !status.success() || validate_auth_file(&paths.auth()).is_err() {
         restore_auth(paths, previous_auth.as_deref())?;
         write_active(paths, previous_active.as_deref())?;
-        return Err(format!(
+        return Err(AppError::authentication(format!(
             "Codex login failed; restored the previous active profile (exit {status})"
-        ));
+        )));
     }
 
     secure_copy(&paths.auth(), &profile)?;
@@ -279,7 +521,7 @@ fn switch(paths: &Paths, name: &str) -> Result<()> {
     ensure_initialized(paths)?;
     let profile = paths.profile(name);
     validate_auth_file(&profile)
-        .map_err(|_| format!("profile '{name}' does not exist or is invalid"))?;
+        .map_err(|_| AppError::profile(format!("profile '{name}' does not exist or is invalid")))?;
 
     if read_active(paths)?.as_deref() == Some(name) {
         print_profile_status("Profile ", name, " is already active.", ANSI_CYAN);
@@ -293,7 +535,7 @@ fn switch(paths: &Paths, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn list(paths: &Paths) -> Result<()> {
+fn list(paths: &Paths, json_output: bool) -> Result<()> {
     let _lock = Lock::acquire(paths)?;
     ensure_initialized(paths)?;
     save_active(paths)?;
@@ -301,11 +543,22 @@ fn list(paths: &Paths) -> Result<()> {
     let mut names = profile_names(paths)?;
     names.sort_unstable();
     if names.is_empty() {
-        print_warning_stdout("No profiles. Run 'codex-switcher add personal'.");
+        if json_output {
+            print_json(&ListJson {
+                schema_version: SCHEMA_VERSION,
+                profiles: Vec::new(),
+            })?;
+        } else {
+            print_warning_stdout("No profiles. Run 'codex-switcher add personal'.");
+        }
         return Ok(());
     }
 
-    let mut spinner = Spinner::start("Loading profile usage...");
+    let mut spinner = if json_output {
+        Spinner::disabled()
+    } else {
+        Spinner::start("Loading profile usage...")
+    };
     let (sender, receiver) = mpsc::channel();
     thread::scope(|scope| {
         for name in &names {
@@ -320,29 +573,53 @@ fn list(paths: &Paths) -> Result<()> {
 
     let results: HashMap<String, Result<Usage>> = receiver.into_iter().collect();
     let mut rows = Vec::new();
+    let mut profiles = Vec::new();
     let mut warnings = Vec::new();
     for name in names {
+        let is_active = active.as_deref() == Some(&name);
         let profile_label = if active.as_deref() == Some(&name) {
             format!("* {name}")
         } else {
             format!("  {name}")
         };
         match results.get(&name) {
-            Some(Ok(usage)) => rows.push(usage.row(profile_label)),
+            Some(Ok(usage)) => {
+                rows.push(usage.row(profile_label));
+                profiles.push(ProfileJson::from_usage(name, is_active, usage, None));
+            }
             Some(Err(error)) => {
                 rows.push(Usage::unavailable().row(profile_label));
                 warnings.push(format!("profile '{name}': {error}"));
+                profiles.push(ProfileJson::from_usage(
+                    name,
+                    is_active,
+                    &Usage::unavailable(),
+                    Some(error.to_string()),
+                ));
             }
             None => {
                 rows.push(Usage::unavailable().row(profile_label));
                 warnings.push(format!("profile '{name}': usage query did not finish"));
+                profiles.push(ProfileJson::from_usage(
+                    name,
+                    is_active,
+                    &Usage::unavailable(),
+                    Some("usage query did not finish".to_owned()),
+                ));
             }
         }
     }
 
-    print_table(&rows);
-    for warning in warnings {
-        print_warning(&warning);
+    if json_output {
+        print_json(&ListJson {
+            schema_version: SCHEMA_VERSION,
+            profiles,
+        })?;
+    } else {
+        print_table(&rows);
+        for warning in warnings {
+            print_warning(&warning);
+        }
     }
     Ok(())
 }
@@ -375,6 +652,69 @@ struct DailyUsage {
     tokens: u64,
 }
 
+#[derive(Serialize)]
+struct ListJson {
+    schema_version: u64,
+    profiles: Vec<ProfileJson>,
+}
+
+#[derive(Serialize)]
+struct ProfileJson {
+    name: String,
+    active: bool,
+    plan: Option<String>,
+    limits: LimitsJson,
+    lifetime_tokens: Option<u64>,
+    error: Option<String>,
+}
+
+impl ProfileJson {
+    fn from_usage(name: String, active: bool, usage: &Usage, error: Option<String>) -> Self {
+        Self {
+            name,
+            active,
+            plan: string_value(&usage.plan),
+            limits: LimitsJson::from_usage(usage),
+            lifetime_tokens: usage.lifetime_tokens,
+            error,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct LimitsJson {
+    five_hour: Option<WindowJson>,
+    weekly: Option<WindowJson>,
+}
+
+impl LimitsJson {
+    fn from_usage(usage: &Usage) -> Self {
+        Self {
+            five_hour: usage.five_hours.as_ref().map(WindowJson::from),
+            weekly: usage.weekly.as_ref().map(WindowJson::from),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WindowJson {
+    used_percent: f64,
+    remaining_percent: f64,
+    window_duration_minutes: u64,
+    resets_at: Option<String>,
+}
+
+impl From<&Window> for WindowJson {
+    fn from(window: &Window) -> Self {
+        Self {
+            used_percent: window.used_percent,
+            remaining_percent: (100.0 - window.used_percent).clamp(0.0, 100.0),
+            window_duration_minutes: window.duration_mins,
+            resets_at: iso_timestamp(window.resets_at),
+        }
+    }
+}
+
 impl Usage {
     fn unavailable() -> Self {
         Self {
@@ -395,19 +735,76 @@ impl Usage {
     }
 }
 
-fn stats(paths: &Paths, name: &str, period_days: u64) -> Result<()> {
+fn stats(paths: &Paths, name: &str, period_days: u64, json_output: bool) -> Result<()> {
     validate_name(name)?;
     let _lock = Lock::acquire(paths)?;
     ensure_initialized(paths)?;
     save_active(paths)?;
     validate_auth_file(&paths.profile(name))
-        .map_err(|_| format!("profile '{name}' does not exist or is invalid"))?;
+        .map_err(|_| AppError::profile(format!("profile '{name}' does not exist or is invalid")))?;
 
-    let mut spinner = Spinner::start("Loading account statistics...");
+    let mut spinner = if json_output {
+        Spinner::disabled()
+    } else {
+        Spinner::start("Loading account statistics...")
+    };
     let usage = query_profile(paths, name);
     spinner.stop();
-    print_stats(name, &usage?, period_days);
+    let usage = usage?;
+    if json_output {
+        print_json(&StatsJson::new(name, &usage, period_days))?;
+    } else {
+        print_stats(name, &usage, period_days);
+    }
     Ok(())
+}
+
+#[derive(Serialize)]
+struct StatsJson<'a> {
+    schema_version: u64,
+    profile: &'a str,
+    plan: Option<String>,
+    lifetime_tokens: Option<u64>,
+    peak_daily_tokens: Option<u64>,
+    longest_running_turn_seconds: Option<u64>,
+    current_streak_days: Option<u64>,
+    longest_streak_days: Option<u64>,
+    available_resets: Option<u64>,
+    limits: LimitsJson,
+    period_days: u64,
+    daily_usage: Vec<DailyUsageJson>,
+}
+
+impl<'a> StatsJson<'a> {
+    fn new(profile: &'a str, usage: &Usage, period_days: u64) -> Self {
+        let today = Local::now().date_naive();
+        Self {
+            schema_version: SCHEMA_VERSION,
+            profile,
+            plan: string_value(&usage.plan),
+            lifetime_tokens: usage.lifetime_tokens,
+            peak_daily_tokens: usage.peak_daily_tokens,
+            longest_running_turn_seconds: usage.longest_running_turn_sec,
+            current_streak_days: usage.current_streak_days,
+            longest_streak_days: usage.longest_streak_days,
+            available_resets: usage.reset_credits,
+            limits: LimitsJson::from_usage(usage),
+            period_days,
+            daily_usage: usage_for_period(&usage.daily_usage, today, period_days)
+                .into_iter()
+                .map(|bucket| DailyUsageJson {
+                    date: bucket.date.format("%Y-%m-%d").to_string(),
+                    tokens: bucket.tokens,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct DailyUsageJson {
+    date: String,
+    tokens: u64,
 }
 
 fn print_stats(name: &str, usage: &Usage, period_days: u64) {
@@ -705,6 +1102,13 @@ struct Spinner {
 }
 
 impl Spinner {
+    fn disabled() -> Self {
+        Self {
+            stop_sender: None,
+            handle: None,
+        }
+    }
+
     fn start(message: &'static str) -> Self {
         if !io::stderr().is_terminal() || terminal_is_dumb() {
             return Self {
@@ -816,14 +1220,16 @@ fn query_profile(paths: &Paths, name: &str) -> Result<Usage> {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|error| format!("cannot start 'codex app-server': {error}"))?,
+            .map_err(|error| {
+                AppError::authentication(format!("cannot start 'codex app-server': {error}"))
+            })?,
     };
 
     let stdout = child
         .child
         .stdout
         .take()
-        .ok_or_else(|| "cannot read from Codex app-server".to_owned())?;
+        .ok_or_else(|| AppError::authentication("cannot read from Codex app-server"))?;
     let (sender, receiver) = mpsc::channel();
     let reader = thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(|line| line.ok()) {
@@ -837,7 +1243,7 @@ fn query_profile(paths: &Paths, name: &str) -> Result<Usage> {
         .child
         .stdin
         .take()
-        .ok_or_else(|| "cannot write to Codex app-server".to_owned())?;
+        .ok_or_else(|| AppError::authentication("cannot write to Codex app-server"))?;
     for message in [
         json!({
             "method": "initialize",
@@ -895,8 +1301,8 @@ fn query_profile(paths: &Paths, name: &str) -> Result<Usage> {
     child.stop();
     let _ = reader.join();
 
-    let account = account.ok_or_else(|| "account query timed out".to_owned())?;
-    let rate_limits = rate_limits.ok_or_else(|| "rate-limit query timed out".to_owned())?;
+    let account = account.ok_or_else(|| AppError::timeout("account query timed out"))?;
+    let rate_limits = rate_limits.ok_or_else(|| AppError::timeout("rate-limit query timed out"))?;
     let mut usage = parse_usage(&account, &rate_limits);
     if let Some(token_usage) = token_usage.as_ref() {
         apply_token_usage(&mut usage, token_usage);
@@ -915,12 +1321,14 @@ fn response_result(message: Value, method: &str) -> Result<Value> {
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("unknown app-server error");
-        return Err(format!("{method} failed: {detail}"));
+        return Err(AppError::authentication(format!(
+            "{method} failed: {detail}"
+        )));
     }
     message
         .get("result")
         .cloned()
-        .ok_or_else(|| format!("{method} returned no result"))
+        .ok_or_else(|| AppError::authentication(format!("{method} returned no result")))
 }
 
 fn parse_usage(account: &Value, rate_limits: &Value) -> Usage {
@@ -1186,13 +1594,13 @@ fn print_warning_stdout(message: &str) {
     println!("{}", styled_message(message, ANSI_YELLOW, colors_enabled()));
 }
 
-fn print_error(message: &str) {
+fn print_error(message: &str, allow_colors: bool) {
     eprintln!(
         "{}",
         styled_message(
             &format!("error: {message}"),
             ANSI_RED,
-            stderr_colors_enabled(),
+            allow_colors && stderr_colors_enabled(),
         )
     );
 }
@@ -1264,12 +1672,27 @@ fn remaining_color(value: &str) -> &'static str {
     }
 }
 
-fn current(paths: &Paths) -> Result<()> {
-    match read_active(paths)? {
-        Some(name) => println!("{}", styled_message(&name, ANSI_GOLD, colors_enabled())),
-        None => print_warning_stdout("No managed profile is active."),
+fn current(paths: &Paths, json_output: bool, format: CurrentFormat) -> Result<()> {
+    let active = read_active(paths)?;
+    if json_output {
+        return print_json(&CurrentJson {
+            schema_version: SCHEMA_VERSION,
+            profile: active,
+        });
+    }
+    match (format, active) {
+        (_, Some(name)) if CurrentFormat::Prompt == format => println!("{name}"),
+        (CurrentFormat::Prompt, None) => {}
+        (_, Some(name)) => println!("{}", styled_message(&name, ANSI_GOLD, colors_enabled())),
+        (_, None) => print_warning_stdout("No managed profile is active."),
     }
     Ok(())
+}
+
+#[derive(Serialize)]
+struct CurrentJson {
+    schema_version: u64,
+    profile: Option<String>,
 }
 
 fn remove(paths: &Paths, name: &str, force: bool) -> Result<()> {
@@ -1277,13 +1700,15 @@ fn remove(paths: &Paths, name: &str, force: bool) -> Result<()> {
     let _lock = Lock::acquire(paths)?;
     let profile = paths.profile(name);
     if !profile.exists() {
-        return Err(format!("profile '{name}' does not exist"));
+        return Err(AppError::profile(format!(
+            "profile '{name}' does not exist"
+        )));
     }
     let is_active = read_active(paths)?.as_deref() == Some(name);
     if is_active && !force {
-        return Err(format!(
+        return Err(AppError::profile(format!(
             "profile '{name}' is active; switch first or pass --force"
-        ));
+        )));
     }
     fs::remove_file(&profile)
         .map_err(|error| format!("cannot remove profile '{name}': {error}"))?;
@@ -1299,37 +1724,79 @@ fn remove(paths: &Paths, name: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
-fn doctor(paths: &Paths) -> Result<()> {
-    let mut healthy = true;
+fn doctor(paths: &Paths, json_output: bool) -> Result<()> {
     let config = fs::read_to_string(paths.config()).unwrap_or_default();
     let configured = has_file_credentials(&config);
-    report(configured, "credential storage is set to 'file'");
-    healthy &= configured;
 
     let auth_ok = validate_auth_file(&paths.auth()).is_ok();
-    report(auth_ok, "active auth.json exists and is non-empty");
-    healthy &= auth_ok;
 
     let active = read_active(paths)?;
     let profile_ok = active
         .as_deref()
         .is_some_and(|name| validate_auth_file(&paths.profile(name)).is_ok());
-    report(profile_ok, "active profile points to a valid saved login");
-    healthy &= profile_ok;
 
     let codex_ok = Command::new("codex")
         .arg("--version")
         .output()
         .is_ok_and(|output| output.status.success());
-    report(codex_ok, "codex executable is available");
-    healthy &= codex_ok;
+    let checks = [
+        DoctorCheck {
+            name: "file_credentials",
+            ok: configured,
+            message: "credential storage is set to 'file'",
+        },
+        DoctorCheck {
+            name: "active_auth",
+            ok: auth_ok,
+            message: "active auth.json exists and is non-empty",
+        },
+        DoctorCheck {
+            name: "active_profile",
+            ok: profile_ok,
+            message: "active profile points to a valid saved login",
+        },
+        DoctorCheck {
+            name: "codex_executable",
+            ok: codex_ok,
+            message: "codex executable is available",
+        },
+    ];
+    let healthy = checks.iter().all(|check| check.ok);
+
+    if json_output {
+        print_json(&DoctorJson {
+            schema_version: SCHEMA_VERSION,
+            healthy,
+            checks,
+        })?;
+    } else {
+        for check in &checks {
+            report(check.ok, check.message);
+        }
+    }
 
     if healthy {
-        print_success("Everything looks good.");
+        if !json_output {
+            print_success("Everything looks good.");
+        }
         Ok(())
     } else {
-        Err("one or more checks failed".to_owned())
+        Err(AppError::initialization("one or more checks failed"))
     }
+}
+
+#[derive(Serialize)]
+struct DoctorJson {
+    schema_version: u64,
+    healthy: bool,
+    checks: [DoctorCheck; 4],
+}
+
+#[derive(Serialize)]
+struct DoctorCheck {
+    name: &'static str,
+    ok: bool,
+    message: &'static str,
 }
 
 fn report(ok: bool, message: &str) {
@@ -1362,7 +1829,7 @@ fn restore_auth(paths: &Paths, content: Option<&[u8]>) -> Result<()> {
 fn ensure_initialized(paths: &Paths) -> Result<()> {
     let config = fs::read_to_string(paths.config()).unwrap_or_default();
     if !has_file_credentials(&config) {
-        return Err("run 'codex-switcher init' first".to_owned());
+        return Err(AppError::initialization("run 'codex-switcher init' first"));
     }
     secure_dir(&paths.profiles())
 }
@@ -1374,12 +1841,16 @@ fn read_active(paths: &Paths) -> Result<Option<String>> {
             if name.is_empty() {
                 Ok(None)
             } else {
-                validate_name(name)?;
+                validate_name(name).map_err(|_| {
+                    AppError::profile("active profile state contains an invalid profile name")
+                })?;
                 Ok(Some(name.to_owned()))
             }
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("cannot read active profile: {error}")),
+        Err(error) => Err(AppError::profile(format!(
+            "cannot read active profile: {error}"
+        ))),
     }
 }
 
@@ -1394,7 +1865,7 @@ fn profile_names(paths: &Paths) -> Result<Vec<String>> {
     let entries = match fs::read_dir(paths.profiles()) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(format!("cannot list profiles: {error}")),
+        Err(error) => return Err(AppError::profile(format!("cannot list profiles: {error}"))),
     };
     let mut names = Vec::new();
     for entry in entries {
@@ -1402,6 +1873,7 @@ fn profile_names(paths: &Paths) -> Result<Vec<String>> {
         let path = entry.path();
         if path.extension().and_then(|value| value.to_str()) == Some("json")
             && let Some(stem) = path.file_stem().and_then(|value| value.to_str())
+            && validate_name(stem).is_ok()
         {
             names.push(stem.to_owned());
         }
@@ -1410,10 +1882,14 @@ fn profile_names(paths: &Paths) -> Result<Vec<String>> {
 }
 
 fn validate_auth_file(path: &Path) -> Result<()> {
-    let metadata =
-        fs::metadata(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let metadata = fs::metadata(path).map_err(|error| {
+        AppError::authentication(format!("cannot read {}: {error}", path.display()))
+    })?;
     if !metadata.is_file() || 0 == metadata.len() {
-        return Err(format!("{} is not a non-empty file", path.display()));
+        return Err(AppError::authentication(format!(
+            "{} is not a non-empty file",
+            path.display()
+        )));
     }
     Ok(())
 }
@@ -1430,7 +1906,10 @@ fn validate_name(name: &str) -> Result<()> {
     if valid_length && valid_start && valid_chars {
         Ok(())
     } else {
-        Err("profile name must be 1-64 characters: letters, numbers, '-' or '_', starting with a letter or number".to_owned())
+        Err(AppError::new(
+            ErrorKind::Arguments,
+            "profile name must be 1-64 characters: letters, numbers, '-' or '_', starting with a letter or number",
+        ))
     }
 }
 
@@ -1486,7 +1965,7 @@ fn secure_dir(path: &Path) -> Result<()> {
 fn set_mode(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
-        .map_err(|error| format!("cannot secure {}: {error}", path.display()))
+        .map_err(|error| AppError::runtime(format!("cannot secure {}: {error}", path.display())))
 }
 
 #[cfg(not(unix))]
@@ -1498,8 +1977,80 @@ fn remove_if_exists(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("cannot remove {}: {error}", path.display())),
+        Err(error) => Err(AppError::runtime(format!(
+            "cannot remove {}: {error}",
+            path.display()
+        ))),
     }
+}
+
+fn completion(paths: &Paths, shell: SupportedShell) -> Result<()> {
+    let mut names = profile_names(paths)?;
+    names.sort_unstable();
+    let command = Cli::command();
+    let mut command = add_profile_completions(command, "use", &names);
+    command = add_profile_completions(command, "stats", &names);
+    command = add_profile_completions(command, "remove", &names);
+    let name = command.get_name().to_owned();
+    let generator: Shell = shell.into();
+    generate(generator, &mut command, name, &mut io::stdout());
+    if SupportedShell::Fish == shell && !names.is_empty() {
+        println!(
+            "complete -c codex-switcher -n '__fish_seen_subcommand_from use switch stats remove rm' -f -a '{}'",
+            names.join(" ")
+        );
+    }
+    Ok(())
+}
+
+fn add_profile_completions(
+    command: clap::Command,
+    subcommand_name: &'static str,
+    names: &[String],
+) -> clap::Command {
+    let values = names.to_vec();
+    command.mut_subcommand(subcommand_name, move |subcommand| {
+        subcommand.mut_arg("name", move |argument| {
+            argument.value_parser(clap::builder::PossibleValuesParser::new(values))
+        })
+    })
+}
+
+fn shell_function(shell: SupportedShell) -> Result<()> {
+    let function = match shell {
+        SupportedShell::Bash | SupportedShell::Zsh => {
+            "cs() {\n  if [ \"$#\" -eq 0 ]; then\n    codex-switcher current\n  else\n    codex-switcher use \"$@\"\n  fi\n}"
+        }
+        SupportedShell::Fish => {
+            "function cs\n  if test (count $argv) -eq 0\n    codex-switcher current\n  else\n    codex-switcher use $argv\n  end\nend"
+        }
+    };
+    println!("{function}");
+    Ok(())
+}
+
+fn print_json<T: Serialize>(value: &T) -> Result<()> {
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    serde_json::to_writer(&mut handle, value)
+        .map_err(|error| AppError::runtime(format!("cannot encode JSON output: {error}")))?;
+    handle
+        .write_all(b"\n")
+        .map_err(|error| AppError::runtime(format!("cannot write JSON output: {error}")))
+}
+
+fn string_value(value: &str) -> Option<String> {
+    if value.is_empty() || "—" == value {
+        None
+    } else {
+        Some(value.to_owned())
+    }
+}
+
+fn iso_timestamp(timestamp: Option<i64>) -> Option<String> {
+    timestamp
+        .and_then(DateTime::<Utc>::from_timestamp_secs)
+        .map(|value| value.to_rfc3339())
 }
 
 fn configure_file_credentials(config: &str) -> String {
@@ -1560,105 +2111,30 @@ fn is_credential_assignment(line: &str) -> bool {
         .is_some_and(|rest| rest.trim_start().starts_with('='))
 }
 
-fn parse_profile_args(args: &[OsString], allow_force: bool) -> Result<(String, bool)> {
-    let mut name = None;
-    let mut force = false;
-    for argument in args {
-        match argument.to_str() {
-            Some("--force") if allow_force => force = true,
-            Some(value) if !value.starts_with('-') && name.is_none() => {
-                name = Some(value.to_owned())
-            }
-            Some(value) => return Err(format!("unexpected argument '{value}'")),
-            None => return Err("arguments must be valid UTF-8".to_owned()),
-        }
-    }
-    name.map(|name| (name, force))
-        .ok_or_else(|| "missing profile name".to_owned())
-}
-
-fn parse_login_args(args: &[OsString]) -> Result<(String, bool, bool)> {
-    let mut name = None;
-    let mut force = false;
-    let mut device_auth = false;
-    for argument in args {
-        match argument.to_str() {
-            Some("--force") => force = true,
-            Some("--device-auth") => device_auth = true,
-            Some(value) if !value.starts_with('-') && name.is_none() => {
-                name = Some(value.to_owned())
-            }
-            Some(value) => return Err(format!("unexpected argument '{value}'")),
-            None => return Err("arguments must be valid UTF-8".to_owned()),
-        }
-    }
-    name.map(|name| (name, force, device_auth))
-        .ok_or_else(|| "missing profile name".to_owned())
-}
-
-fn parse_stats_args(args: &[OsString]) -> Result<(String, u64)> {
-    const DEFAULT_PERIOD_DAYS: u64 = 7;
-    const MAX_PERIOD_DAYS: u64 = 365;
-
-    let mut name = None;
-    let mut period_days = DEFAULT_PERIOD_DAYS;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].to_str() {
-            Some("--period") => {
-                index += 1;
-                let value = args
-                    .get(index)
-                    .and_then(|value| value.to_str())
-                    .ok_or_else(|| "missing value for --period".to_owned())?;
-                period_days = parse_period(value, MAX_PERIOD_DAYS)?;
-            }
-            Some(value) if !value.starts_with('-') && name.is_none() => {
-                name = Some(value.to_owned());
-            }
-            Some(value) => return Err(format!("unexpected argument '{value}'")),
-            None => return Err("arguments must be valid UTF-8".to_owned()),
-        }
-        index += 1;
-    }
-
-    name.map(|name| (name, period_days))
-        .ok_or_else(|| "missing profile name".to_owned())
-}
-
 fn parse_period(value: &str, maximum_days: u64) -> Result<u64> {
-    let number = value
-        .strip_suffix('d')
-        .ok_or_else(|| "period must use the form Nd, for example 30d".to_owned())?;
-    let days = number
-        .parse::<u64>()
-        .map_err(|_| "period must use the form Nd, for example 30d".to_owned())?;
+    let number = value.strip_suffix('d').ok_or_else(|| {
+        AppError::new(
+            ErrorKind::Arguments,
+            "period must use the form Nd, for example 30d",
+        )
+    })?;
+    let days = number.parse::<u64>().map_err(|_| {
+        AppError::new(
+            ErrorKind::Arguments,
+            "period must use the form Nd, for example 30d",
+        )
+    })?;
     if 0 == days || maximum_days < days {
-        return Err(format!("period must be between 1d and {maximum_days}d"));
+        return Err(AppError::new(
+            ErrorKind::Arguments,
+            format!("period must be between 1d and {maximum_days}d"),
+        ));
     }
     Ok(days)
 }
 
-fn print_help() {
-    println!(
-        "codex-switcher {VERSION}\n\
-         Fast account switching for Codex CLI and IDE integrations.\n\n\
-         USAGE:\n\
-           codex-switcher init\n\
-           codex-switcher add <name> [--force]\n\
-           codex-switcher login <name> [--device-auth] [--force]\n\
-           codex-switcher use <name>\n\
-           codex-switcher list\n\
-           codex-switcher stats <name> [--period <Nd>]\n\
-           codex-switcher current\n\
-           codex-switcher remove <name> [--force]\n\
-           codex-switcher doctor\n\n\
-         EXAMPLE:\n\
-           codex-switcher init\n\
-           codex-switcher add personal\n\
-           codex-switcher login work\n\
-           codex-switcher use personal"
-    );
+fn parse_period_value(value: &str) -> std::result::Result<u64, String> {
+    parse_period(value, 365).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

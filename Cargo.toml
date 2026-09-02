@@ -1,6 +1,6 @@
 [package]
 name = "codex-switcher"
-version = "1.1.1"
+version = "1.2.0"
 edition = "2024"
 description = "Fast, local account switching for Codex CLI and IDE integrations"
 authors = ["Damian Grubecki"]
@@ -23,6 +23,9 @@ include = [
 
 [dependencies]
 chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
+clap = { version = "4.5.47", features = ["derive", "string"] }
+clap_complete = "4.5.57"
+serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"
 
 [profile.release]
