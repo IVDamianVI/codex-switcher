@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::mpsc;
@@ -16,6 +16,13 @@ const CREDENTIAL_SETTING: &str = "cli_auth_credentials_store";
 const FIVE_HOURS_MINS: u64 = 5 * 60;
 const WEEK_MINS: u64 = 7 * 24 * 60;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(20);
+const ANSI_RESET: &str = "\x1b[0m";
+const ANSI_GREEN: &str = "\x1b[32m";
+const ANSI_CYAN: &str = "\x1b[36m";
+const ANSI_YELLOW: &str = "\x1b[33m";
+const ANSI_RED: &str = "\x1b[31m";
+const ANSI_GOLD: &str = "\x1b[1;33m";
+const ANSI_HINT: &str = "\x1b[2;37m";
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -23,7 +30,7 @@ fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("error: {message}");
+            print_error(&message);
             ExitCode::FAILURE
         }
     }
@@ -174,15 +181,15 @@ fn initialize(paths: &Paths) -> Result<()> {
             }
         }
         atomic_write(&config_path, updated.as_bytes(), 0o600)?;
-        println!(
+        print_success(&format!(
             "Configured file-based Codex credentials in {}.",
             config_path.display()
-        );
+        ));
     } else {
-        println!("File-based Codex credentials are already configured.");
+        print_success("File-based Codex credentials are already configured.");
     }
 
-    println!("Next: codex-switcher add personal");
+    print_hint("Next: codex-switcher add personal");
     Ok(())
 }
 
@@ -202,7 +209,12 @@ fn capture(paths: &Paths, name: &str, force: bool) -> Result<()> {
     save_active(paths)?;
     secure_copy(&auth, &destination)?;
     write_active(paths, Some(name))?;
-    println!("Captured the current Codex login as profile '{name}'.");
+    print_profile_status(
+        "Captured the current Codex login as profile ",
+        name,
+        ".",
+        ANSI_GREEN,
+    );
     Ok(())
 }
 
@@ -223,7 +235,7 @@ fn login(paths: &Paths, name: &str, force: bool, device_auth: bool) -> Result<()
     let previous_active = read_active(paths)?;
     remove_if_exists(&paths.auth())?;
 
-    println!("Starting Codex login for profile '{name}'...");
+    print_profile_status("Starting Codex login for profile ", name, "...", ANSI_CYAN);
     let mut command = Command::new("codex");
     command.arg("login");
     if device_auth {
@@ -250,7 +262,7 @@ fn login(paths: &Paths, name: &str, force: bool, device_auth: bool) -> Result<()
 
     secure_copy(&paths.auth(), &profile)?;
     write_active(paths, Some(name))?;
-    println!("Profile '{name}' is logged in and active.");
+    print_profile_status("Profile ", name, " is logged in and active.", ANSI_GREEN);
     Ok(())
 }
 
@@ -263,15 +275,14 @@ fn switch(paths: &Paths, name: &str) -> Result<()> {
         .map_err(|_| format!("profile '{name}' does not exist or is invalid"))?;
 
     if read_active(paths)?.as_deref() == Some(name) {
-        println!("Profile '{name}' is already active.");
+        print_profile_status("Profile ", name, " is already active.", ANSI_CYAN);
         return Ok(());
     }
 
     save_active(paths)?;
     secure_copy(&profile, &paths.auth())?;
     write_active(paths, Some(name))?;
-    println!("Switched to profile '{name}'.");
-    println!("Restart the Codex chat in your IDE if it was already open.");
+    print_switch_confirmation(name);
     Ok(())
 }
 
@@ -283,10 +294,11 @@ fn list(paths: &Paths) -> Result<()> {
     let mut names = profile_names(paths)?;
     names.sort_unstable();
     if names.is_empty() {
-        println!("No profiles. Run 'codex-switcher add personal'.");
+        print_warning_stdout("No profiles. Run 'codex-switcher add personal'.");
         return Ok(());
     }
 
+    let mut spinner = Spinner::start("Loading profile usage...");
     let (sender, receiver) = mpsc::channel();
     thread::scope(|scope| {
         for name in &names {
@@ -297,6 +309,7 @@ fn list(paths: &Paths) -> Result<()> {
         }
     });
     drop(sender);
+    spinner.stop();
 
     let results: HashMap<String, Result<Usage>> = receiver.into_iter().collect();
     let mut rows = Vec::new();
@@ -322,7 +335,7 @@ fn list(paths: &Paths) -> Result<()> {
 
     print_table(&rows);
     for warning in warnings {
-        eprintln!("warning: {warning}");
+        print_warning(&warning);
     }
     Ok(())
 }
@@ -338,6 +351,7 @@ struct Usage {
     plan: String,
     five_hours: Option<Window>,
     weekly: Option<Window>,
+    lifetime_tokens: Option<u64>,
 }
 
 impl Usage {
@@ -352,13 +366,66 @@ impl Usage {
         vec![
             profile,
             value_or_dash(&self.plan),
-            format_used(self.five_hours.as_ref()),
             format_left(self.five_hours.as_ref()),
-            format_used(self.weekly.as_ref()),
-            format_left(self.weekly.as_ref()),
             format_reset(self.five_hours.as_ref()),
+            format_left(self.weekly.as_ref()),
             format_reset(self.weekly.as_ref()),
+            format_tokens(self.lifetime_tokens),
         ]
+    }
+}
+
+struct Spinner {
+    stop_sender: Option<mpsc::Sender<()>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Spinner {
+    fn start(message: &'static str) -> Self {
+        if !io::stderr().is_terminal() || terminal_is_dumb() {
+            return Self {
+                stop_sender: None,
+                handle: None,
+            };
+        }
+
+        let (stop_sender, stop_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let mut frame = 0;
+            loop {
+                eprint!("\r{} {message}", FRAMES[frame]);
+                let _ = io::stderr().flush();
+                match stop_receiver.recv_timeout(Duration::from_millis(80)) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        frame = (frame + 1) % FRAMES.len();
+                    }
+                }
+            }
+            eprint!("\r{}\r", " ".repeat(message.chars().count() + 2));
+            let _ = io::stderr().flush();
+        });
+
+        Self {
+            stop_sender: Some(stop_sender),
+            handle: Some(handle),
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some(sender) = self.stop_sender.take() {
+            let _ = sender.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for Spinner {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -462,6 +529,7 @@ fn query_profile(paths: &Paths, name: &str) -> Result<Usage> {
         json!({ "method": "initialized", "params": {} }),
         json!({ "method": "account/read", "id": 1, "params": { "refreshToken": false } }),
         json!({ "method": "account/rateLimits/read", "id": 2, "params": {} }),
+        json!({ "method": "account/usage/read", "id": 3, "params": {} }),
     ] {
         serde_json::to_writer(&mut stdin, &message)
             .map_err(|error| format!("cannot encode app-server request: {error}"))?;
@@ -476,7 +544,9 @@ fn query_profile(paths: &Paths, name: &str) -> Result<Usage> {
     let deadline = Instant::now() + QUERY_TIMEOUT;
     let mut account = None;
     let mut rate_limits = None;
-    while account.is_none() || rate_limits.is_none() {
+    let mut token_usage = None;
+    let mut token_usage_finished = false;
+    while account.is_none() || rate_limits.is_none() || !token_usage_finished {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
@@ -487,6 +557,10 @@ fn query_profile(paths: &Paths, name: &str) -> Result<Usage> {
             }
             Ok(message) if message.get("id").and_then(Value::as_i64) == Some(2) => {
                 rate_limits = Some(response_result(message, "account/rateLimits/read")?);
+            }
+            Ok(message) if message.get("id").and_then(Value::as_i64) == Some(3) => {
+                token_usage = response_result(message, "account/usage/read").ok();
+                token_usage_finished = true;
             }
             Ok(_) => {}
             Err(_) => break,
@@ -499,7 +573,8 @@ fn query_profile(paths: &Paths, name: &str) -> Result<Usage> {
 
     let account = account.ok_or_else(|| "account query timed out".to_owned())?;
     let rate_limits = rate_limits.ok_or_else(|| "rate-limit query timed out".to_owned())?;
-    let usage = parse_usage(&account, &rate_limits);
+    let mut usage = parse_usage(&account, &rate_limits);
+    usage.lifetime_tokens = token_usage.as_ref().and_then(parse_lifetime_tokens);
 
     let refreshed_auth = query_dir.path.join("auth.json");
     if validate_auth_file(&refreshed_auth).is_ok() {
@@ -554,7 +629,14 @@ fn parse_usage(account: &Value, rate_limits: &Value) -> Usage {
         plan,
         five_hours: find_window(&windows, FIVE_HOURS_MINS),
         weekly: find_window(&windows, WEEK_MINS),
+        lifetime_tokens: None,
     }
+}
+
+fn parse_lifetime_tokens(token_usage: &Value) -> Option<u64> {
+    token_usage
+        .pointer("/summary/lifetimeTokens")
+        .and_then(Value::as_u64)
 }
 
 fn collect_windows(bucket: &Value, windows: &mut Vec<(u64, Window)>) {
@@ -607,12 +689,6 @@ fn find_plan_type(value: &Value) -> Option<&str> {
         })
 }
 
-fn format_used(window: Option<&Window>) -> String {
-    window
-        .map(|window| format_percent(window.used_percent))
-        .unwrap_or_else(|| "—".to_owned())
-}
-
 fn format_left(window: Option<&Window>) -> String {
     window
         .map(|window| format_percent((100.0 - window.used_percent).clamp(0.0, 100.0)))
@@ -631,6 +707,36 @@ fn format_reset(window: Option<&Window>) -> String {
         .unwrap_or_else(|| "—".to_owned())
 }
 
+fn format_tokens(tokens: Option<u64>) -> String {
+    tokens
+        .map(format_token_count)
+        .unwrap_or_else(|| "—".to_owned())
+}
+
+fn format_token_count(tokens: u64) -> String {
+    const UNITS: [(u64, u64, &str); 4] = [
+        (1_000_000_000_000, 999_950_000_000, "T"),
+        (1_000_000_000, 999_950_000, "B"),
+        (1_000_000, 999_950, "M"),
+        (1_000, 1_000, "K"),
+    ];
+
+    for (divisor, threshold, suffix) in UNITS {
+        if threshold <= tokens {
+            let tenths = (u128::from(tokens) * 10 + u128::from(divisor) / 2) / u128::from(divisor);
+            let whole = tenths / 10;
+            let fraction = tenths % 10;
+            return if 0 == fraction {
+                format!("{whole}{suffix}")
+            } else {
+                format!("{whole},{fraction}{suffix}")
+            };
+        }
+    }
+
+    tokens.to_string()
+}
+
 fn value_or_dash(value: &str) -> String {
     if value.is_empty() {
         "—".to_owned()
@@ -640,15 +746,14 @@ fn value_or_dash(value: &str) -> String {
 }
 
 fn print_table(rows: &[Vec<String>]) {
-    const HEADERS: [&str; 8] = [
+    const HEADERS: [&str; 7] = [
         "PROFILE",
         "PLAN",
-        "5H USED",
         "5H LEFT",
-        "WEEKLY USED",
-        "WEEKLY LEFT",
         "5H RESET",
+        "WEEKLY LEFT",
         "WEEKLY RESET",
+        "TOKENS USED",
     ];
     let mut widths: Vec<usize> = HEADERS.iter().map(|header| header.len()).collect();
     for row in rows {
@@ -656,30 +761,153 @@ fn print_table(rows: &[Vec<String>]) {
             widths[index] = widths[index].max(value.chars().count());
         }
     }
-    print_table_row(&HEADERS.map(str::to_owned), &widths);
+    let colors = colors_enabled();
+    println!();
+    print_table_row(&HEADERS.map(str::to_owned), &widths, true, colors);
     for row in rows {
-        print_table_row(row, &widths);
-    }
-}
-
-fn print_table_row(row: &[String], widths: &[usize]) {
-    for (index, value) in row.iter().enumerate() {
-        if 0 < index {
-            print!("  ");
-        }
-        if index + 1 == row.len() {
-            print!("{value}");
-        } else {
-            print!("{value:<width$}", width = widths[index]);
-        }
+        print_table_row(row, &widths, false, colors);
     }
     println!();
 }
 
+fn print_table_row(row: &[String], widths: &[usize], header: bool, colors: bool) {
+    for (index, value) in row.iter().enumerate() {
+        if 0 < index {
+            print!("  ");
+        }
+        let cell = if index + 1 == row.len() {
+            value.to_owned()
+        } else {
+            format!("{value:<width$}", width = widths[index])
+        };
+        print!("{}", colorize_cell(&cell, value, index, header, colors));
+    }
+    println!();
+}
+
+fn colors_enabled() -> bool {
+    io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none() && !terminal_is_dumb()
+}
+
+fn stderr_colors_enabled() -> bool {
+    io::stderr().is_terminal() && env::var_os("NO_COLOR").is_none() && !terminal_is_dumb()
+}
+
+fn terminal_is_dumb() -> bool {
+    env::var("TERM").is_ok_and(|term| "dumb" == term)
+}
+
+fn print_switch_confirmation(name: &str) {
+    for line in switch_confirmation(name, colors_enabled()) {
+        println!("{line}");
+    }
+}
+
+fn switch_confirmation(name: &str, colors: bool) -> [String; 2] {
+    [
+        profile_status("Switched to profile ", name, ".", ANSI_GREEN, colors),
+        styled_message(
+            "Restart the Codex chat in your IDE if it was already open.",
+            ANSI_HINT,
+            colors,
+        ),
+    ]
+}
+
+fn print_success(message: &str) {
+    println!("{}", styled_message(message, ANSI_GREEN, colors_enabled()));
+}
+
+fn print_hint(message: &str) {
+    println!("{}", styled_message(message, ANSI_HINT, colors_enabled()));
+}
+
+fn print_warning_stdout(message: &str) {
+    println!("{}", styled_message(message, ANSI_YELLOW, colors_enabled()));
+}
+
+fn print_error(message: &str) {
+    eprintln!(
+        "{}",
+        styled_message(
+            &format!("error: {message}"),
+            ANSI_RED,
+            stderr_colors_enabled(),
+        )
+    );
+}
+
+fn print_warning(message: &str) {
+    eprintln!(
+        "{}",
+        styled_message(
+            &format!("warning: {message}"),
+            ANSI_YELLOW,
+            stderr_colors_enabled(),
+        )
+    );
+}
+
+fn print_profile_status(prefix: &str, name: &str, suffix: &str, color: &str) {
+    println!(
+        "{}",
+        profile_status(prefix, name, suffix, color, colors_enabled())
+    );
+}
+
+fn profile_status(prefix: &str, name: &str, suffix: &str, color: &str, colors: bool) -> String {
+    if colors {
+        format!("{color}{prefix}{ANSI_GOLD}'{name}'{ANSI_RESET}{color}{suffix}{ANSI_RESET}")
+    } else {
+        format!("{prefix}'{name}'{suffix}")
+    }
+}
+
+fn styled_message(message: &str, color: &str, colors: bool) -> String {
+    if colors {
+        format!("{color}{message}{ANSI_RESET}")
+    } else {
+        message.to_owned()
+    }
+}
+
+fn colorize_cell(cell: &str, value: &str, index: usize, header: bool, colors: bool) -> String {
+    if !colors {
+        return cell.to_owned();
+    }
+
+    let style = if header {
+        "\x1b[1;36m"
+    } else {
+        match index {
+            0 if value.starts_with("* ") => "\x1b[1;33m",
+            1 => "\x1b[35m",
+            2 | 4 => remaining_color(value),
+            3 | 5 | 6 => "\x1b[37m",
+            _ => "",
+        }
+    };
+    if style.is_empty() {
+        cell.to_owned()
+    } else {
+        format!("{style}{cell}\x1b[0m")
+    }
+}
+
+fn remaining_color(value: &str) -> &'static str {
+    let remaining = value.trim_end_matches('%').parse::<f64>().ok();
+    match remaining {
+        Some(value) if 50.0 <= value => "\x1b[32m",
+        Some(value) if 20.0 <= value => "\x1b[33m",
+        Some(_) => "\x1b[31m",
+        None => "\x1b[2m",
+    }
+}
+
 fn current(paths: &Paths) -> Result<()> {
     match read_active(paths)? {
-        Some(name) => println!("{name}"),
-        None => println!("No managed profile is active."),
+        Some(name) => println!("{}", styled_message(&name, ANSI_GOLD, colors_enabled())),
+        None => print_warning_stdout("No managed profile is active."),
     }
     Ok(())
 }
@@ -702,7 +930,12 @@ fn remove(paths: &Paths, name: &str, force: bool) -> Result<()> {
     if is_active {
         write_active(paths, None)?;
     }
-    println!("Removed profile '{name}'. The active Codex login was not logged out.");
+    print_profile_status(
+        "Removed profile ",
+        name,
+        ". The active Codex login was not logged out.",
+        ANSI_GREEN,
+    );
     Ok(())
 }
 
@@ -732,7 +965,7 @@ fn doctor(paths: &Paths) -> Result<()> {
     healthy &= codex_ok;
 
     if healthy {
-        println!("Everything looks good.");
+        print_success("Everything looks good.");
         Ok(())
     } else {
         Err("one or more checks failed".to_owned())
@@ -740,7 +973,13 @@ fn doctor(paths: &Paths) -> Result<()> {
 }
 
 fn report(ok: bool, message: &str) {
-    println!("{} {message}", if ok { "[ok]" } else { "[!!]" });
+    let marker = if ok { "[ok]" } else { "[!!]" };
+    let color = if ok { ANSI_GREEN } else { ANSI_RED };
+    if colors_enabled() {
+        println!("{color}{marker}{ANSI_RESET} {message}");
+    } else {
+        println!("{marker} {message}");
+    }
 }
 
 fn save_active(paths: &Paths) -> Result<()> {
@@ -1091,5 +1330,67 @@ mod tests {
         assert_eq!(usage.plan, "API");
         assert!(usage.five_hours.is_none());
         assert!(usage.weekly.is_none());
+    }
+
+    #[test]
+    fn parses_and_formats_lifetime_token_usage() {
+        let usage = json!({ "summary": { "lifetimeTokens": 1_500_000 } });
+        assert_eq!(parse_lifetime_tokens(&usage), Some(1_500_000));
+        assert_eq!(format_token_count(100), "100");
+        assert_eq!(format_token_count(900), "900");
+        assert_eq!(format_token_count(1_000), "1K");
+        assert_eq!(format_token_count(654_400), "654,4K");
+        assert_eq!(format_token_count(1_500_000), "1,5M");
+        assert_eq!(format_token_count(4_200_000), "4,2M");
+        assert_eq!(format_token_count(999_999), "1M");
+        assert_eq!(format_tokens(None), "—");
+    }
+
+    #[test]
+    fn colors_table_cells_by_meaning() {
+        assert!(
+            colorize_cell("* personal", "* personal", 0, false, true).starts_with("\x1b[1;33m")
+        );
+        assert!(colorize_cell("PLUS", "PLUS", 1, false, true).starts_with("\x1b[35m"));
+        assert!(
+            colorize_cell("2026-09-02 12:00", "2026-09-02 12:00", 3, false, true)
+                .starts_with("\x1b[37m")
+        );
+    }
+
+    #[test]
+    fn styles_switch_confirmation_without_changing_plain_output() {
+        let colored = switch_confirmation("priv", true);
+        assert!(colored[0].starts_with("\x1b[32mSwitched to profile "));
+        assert!(colored[0].contains("\x1b[1;33m'priv'"));
+        assert!(colored[1].starts_with("\x1b[2;37mRestart"));
+
+        assert_eq!(
+            switch_confirmation("priv", false),
+            [
+                "Switched to profile 'priv'.",
+                "Restart the Codex chat in your IDE if it was already open."
+            ]
+        );
+    }
+
+    #[test]
+    fn styles_status_messages_without_changing_plain_output() {
+        assert_eq!(
+            profile_status("Removed profile ", "priv", ".", ANSI_GREEN, false),
+            "Removed profile 'priv'."
+        );
+        assert_eq!(
+            profile_status("Removed profile ", "priv", ".", ANSI_GREEN, true),
+            "\x1b[32mRemoved profile \x1b[1;33m'priv'\x1b[0m\x1b[32m.\x1b[0m"
+        );
+        assert_eq!(
+            styled_message("Everything looks good.", ANSI_GREEN, true),
+            "\x1b[32mEverything looks good.\x1b[0m"
+        );
+        assert_eq!(
+            styled_message("Everything looks good.", ANSI_GREEN, false),
+            "Everything looks good."
+        );
     }
 }

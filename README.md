@@ -15,8 +15,8 @@ local authentication cache, including JetBrains IDEs such as PhpStorm.
 - Create named profiles such as `personal` and `work`.
 - Switch the active account with one command.
 - Use the same active profile in Codex CLI and supported IDE integrations.
-- Display the ChatGPT plan, five-hour usage, weekly usage, remaining quota, and
-  reset times for every profile.
+- Display the ChatGPT plan, remaining five-hour and weekly quota, reset times,
+  and lifetime token usage for every profile.
 - Preserve refreshed OAuth credentials when switching profiles.
 - Replace the active authentication file atomically.
 - Store profile files with restrictive Unix permissions (`0600` for files and
@@ -147,14 +147,19 @@ app-server account API. It does not change the account active in Codex CLI or
 your IDE.
 
 ```text
-PROFILE     PLAN  5H USED  5H LEFT  WEEKLY USED  WEEKLY LEFT  5H RESET          WEEKLY RESET
-* personal  PLUS  25%      75%      40%          60%          2026-09-01 23:15  2026-09-07 10:00
-  work      PRO   10%      90%      15%          85%          2026-09-01 22:40  2026-09-06 08:00
+PROFILE     PLAN  5H LEFT  5H RESET          WEEKLY LEFT  WEEKLY RESET      TOKENS USED
+* personal  PLUS  75%      2026-09-01 23:15  60%          2026-09-07 10:00  1,5M
+  work      PRO   90%      2026-09-01 22:40  85%          2026-09-06 08:00  654,4K
 ```
 
 Reset times use the computer's local time zone. A dash (`—`) means the service
 did not return that field, the exact quota window is unavailable, or the
-profile uses API-key billing instead of a ChatGPT subscription quota.
+profile uses API-key billing instead of a ChatGPT subscription quota. In an
+interactive terminal, remaining quota is colored green, yellow, or red and a
+spinner is shown while profile information is loading. The active profile is
+gold, the plan is purple, and reset times use plain white for contrast. Set
+`NO_COLOR` to disable colors. `TOKENS USED` is the lifetime total reported by
+Codex and is abbreviated to the largest practical unit with one decimal place.
 
 ## Storage and security
 

@@ -52,7 +52,7 @@ dependencies = [
 
 [[package]]
 name = "codex-switcher"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "chrono",
  "serde_json",

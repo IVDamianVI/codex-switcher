@@ -1,6 +1,6 @@
 [package]
 name = "codex-switcher"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "Fast, local account switching for Codex CLI and IDE integrations"
 authors = ["Damian Grubecki"]

@@ -115,6 +115,8 @@ read -r account
 printf '%s\n' '{"id":1,"result":{"account":{"type":"chatgpt","planType":"plus"},"requiresOpenaiAuth":true}}'
 read -r limits
 printf '%s\n' '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":25,"windowDurationMins":300,"resetsAt":1893456000},"secondary":{"usedPercent":40,"windowDurationMins":10080,"resetsAt":1893888000}}}}'
+read -r usage
+printf '%s\n' '{"id":3,"result":{"summary":{"lifetimeTokens":1500000},"dailyUsageBuckets":[]}}'
 read -r wait
 "#,
     )
@@ -138,13 +140,20 @@ read -r wait
     );
     let stdout = String::from_utf8(output.stdout).expect("output should be UTF-8");
     assert!(stdout.contains("PROFILE"));
+    assert!(stdout.contains("5H LEFT"));
+    assert!(stdout.contains("WEEKLY LEFT"));
     assert!(stdout.contains("WEEKLY RESET"));
+    assert!(stdout.contains("TOKENS USED"));
     assert!(stdout.contains("* personal"));
     assert!(stdout.contains("PLUS"));
-    assert!(stdout.contains("25%"));
     assert!(stdout.contains("75%"));
-    assert!(stdout.contains("40%"));
     assert!(stdout.contains("60%"));
+    assert!(stdout.contains("1,5M"));
+    assert!(!stdout.contains("5H USED"));
+    assert!(!stdout.contains("WEEKLY USED"));
+    assert!(!stdout.contains("\u{1b}["));
+    assert!(stdout.starts_with('\n'));
+    assert!(stdout.ends_with("\n\n"));
 
     fs::remove_dir_all(home).expect("test home should be removed");
 }
